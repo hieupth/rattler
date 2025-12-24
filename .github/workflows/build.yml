@@ -3,19 +3,21 @@ name: Build image
 on:
   workflow_dispatch:
   push:
-    branches:
-      - 'main'
+    branches: ["main"]
     paths:
       - "dockerfile"
       - ".github/workflows/build.yml"
 
 jobs:
   build:
+    name: Build (${{ matrix.platform }}) NV=${{ matrix.nv_release }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         nv_release: ["25.11"]
         platform: ["linux/amd64", "linux/arm64"]
+
     steps:
       - 
         name: Free Disk Space (Ubuntu)
@@ -28,6 +30,11 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - 
         name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -40,18 +47,91 @@ jobs:
         name: Login to DockerHub
         uses: docker/login-action@v3
         with:
-          username: ${{vars.DOCKERHUB_USERNAME}}
-          password: ${{secrets.DOCKERHUB_TOKEN}}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - 
-        name: Checkout
-        uses: actions/checkout@v4
+        name: Normalize platform tag
+        id: plat
+        run: |
+          set -euo pipefail
+          p="${{ matrix.platform }}"
+          p="${p//\//-}"   # linux/amd64 -> linux-amd64
+          echo "plat_tag=$p" >> "$GITHUB_OUTPUT"
+      # IMPORTANT:
+      # - Do NOT set `tags:` here (push-by-digest cannot push a tagged ref).
+      # - We will tag (create manifest list) in the merge job.
       - 
-        name: Build and push
-        uses: docker/build-push-action@v5
+        name: Build and push (by digest)
+        id: build
+        uses: docker/build-push-action@v6
         with:
-          push: true
+          context: .
           file: dockerfile
-          platforms: ${{matrix.platform}}
-          tags: ${{vars.DOCKERHUB_USERNAME}}/rattler:${{matrix.nv_release}}
+          platforms: ${{ matrix.platform }}
+          push: true
           build-args: |
-            NV_RELEASE=${{matrix.nv_release}}
+            NV_RELEASE=${{ matrix.nv_release }}
+          outputs: |
+            type=image,name=docker.io/${{ vars.DOCKERHUB_USERNAME }}/rattler,push-by-digest=true,name-canonical=true
+      - 
+        name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.nv_release }}-${{ steps.plat.outputs.plat_tag }}.digest"
+      - 
+        name: Upload digests (retention 1 day)
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.nv_release }}-${{ steps.plat.outputs.plat_tag }}
+          path: /tmp/digests/*.digest
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest NV=${{ matrix.nv_release }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        nv_release: ["25.11"]
+    steps:
+      - 
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - 
+        name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - 
+        name: Download digests (retention 1 day artifacts)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.nv_release }}-*
+          path: /tmp/digests
+          merge-multiple: true
+      - 
+        name: Create and push manifest list tag
+        run: |
+          set -euo pipefail
+          #
+          REPO="docker.io/${{ vars.DOCKERHUB_USERNAME }}/rattler"
+          TAG="${{ matrix.nv_release }}"
+          #
+          IMAGES=""
+          for f in /tmp/digests/*.digest; do
+            d="$(cat "$f")"
+            IMAGES="$IMAGES ${REPO}@${d}"
+          done
+          #
+          echo "Creating manifest list: ${REPO}:${TAG}"
+          echo "Includes: ${IMAGES}"
+          #
+          docker buildx imagetools create \
+            -t "${REPO}:${TAG}" \
+            ${IMAGES}
+          #
+          docker buildx imagetools inspect "${REPO}:${TAG}"
