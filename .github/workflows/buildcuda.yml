@@ -1,0 +1,58 @@
+name: Build cuda image
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build image"]
+    types: [completed]
+  push:
+    branches: ["main"]
+    paths:
+      - "cuda.dockerfile"
+      - ".github/workflows/buildcuda.yml"
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }}) NV=${{ matrix.nv_release }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nv_release: ["25.11"]
+        platform: ["linux/amd64", "linux/arm64"]
+
+    steps:
+      - 
+        name: Checkout
+        uses: actions/checkout@v4
+      - 
+        name: Build per-platform (push-by-digest + upload digest artifact)
+        uses: hieupth/docker-actions/docker-multiarch-build@main
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          image: ${{ vars.DOCKERHUB_USERNAME }}/namba
+          tag: ${{ matrix.nv_release }}-cuda
+          platform: ${{ matrix.platform }}
+          dockerfile: ./cuda.dockerfile
+          artifact_prefix: digests
+          retention_days: "1"
+          build_args: |
+            NV_RELEASE=${{ matrix.nv_release }}
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        nv_release: ["25.11"]
+    steps:
+      - name: Merge digests into single multi-arch tag
+        uses: hieupth/docker-actions/docker-multiarch-merge@main
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          image: ${{ vars.DOCKERHUB_USERNAME }}/namba
+          tag: ${{ matrix.nv_release }}-cuda
+          artifact_prefix: digests
